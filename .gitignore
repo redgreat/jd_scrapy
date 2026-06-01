@@ -157,6 +157,16 @@ ENV/
 env.bak/
 venv.bak/
 
+# Outputs
+output/
+*.xlsx
+
+# Playwright browsers
+.playwright/
+
+# Local config
+conf/config.yml
+
 # Spyder project settings
 .spyderproject
 .spyproject

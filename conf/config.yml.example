@@ -1,0 +1,45 @@
+mysql:
+  # MySQL主机地址
+  host: "rm-xxxx.mysql.rds.aliyuncs.com"
+  # MySQL端口
+  port: 3306
+  # MySQL用户名
+  user: "user_wh"
+  # MySQL密码
+  password: "replace_me"
+  # MySQL库名
+  database: "whcenter"
+  # 落库表名（不存在会自动创建）
+  table: "job_salary_raw"
+  # 是否启用落库
+  enabled: false
+
+crawl:
+  # 抓取平台：boss / zhilian / both
+  platform: "both"
+  # 是否无头模式；遇到验证码建议 false 手动过一次
+  headless: true
+  # 代理；格式示例：http://user:pass@host:port；不使用填 null
+  proxy: null
+  # Playwright slow_mo（毫秒）
+  slowmo_ms: 0
+  # 翻页/城市切换最小等待秒数
+  sleep_min: 2.0
+  # 翻页/城市切换最大等待秒数
+  sleep_max: 5.0
+  # 每个城市抓取页数
+  pages_per_city: 1
+  # 限制岗位关键词数量（用于调试）；0 或不填表示不限制
+  max_keywords: 5
+  # 输出Excel路径；如果文件被占用会自动加时间戳另存
+  output_excel: "output/salary.xlsx"
+
+data:
+  # 城市列表（中文名即可）
+  cities:
+    - "青岛"
+  # 岗位关键词列表（按这个列表逐个抓取）
+  keywords:
+    - "QA工程师"
+    - "仓库管理专员"
+    - "数据管理架构师"
