@@ -403,9 +403,20 @@ def classify_role(text: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
 
 
 def filter_records_by_keyword(records: Sequence[JobRecord], keyword: str, city: Optional[str] = None) -> List[JobRecord]:
-    """按关键词推断约束对结果做轻量过滤，降低模糊搜索带来的噪音。"""
+    """按关键词推断约束对结果做轻量过滤，降低模糊搜索带来的噪音，必要时自动降级以避免全空。"""
+    kept, _stats = filter_records_with_reason_stats(records, keyword=keyword, city=city)
+    return kept
+
+
+def filter_records_with_reason_stats(
+    records: Sequence[JobRecord], keyword: str, city: Optional[str] = None
+) -> Tuple[List[JobRecord], Dict[str, Any]]:
+    """对岗位记录做关键词过滤，并输出用于定位 kept=0 的原因统计。"""
     base, level = classify_role(keyword)
-    city_text = str(city).strip() if city else ""
+    city_raw = str(city).strip() if city else ""
+    city_text = city_raw
+    if city_text and re.fullmatch(r"\d{2,12}", city_text):
+        city_text = ""
 
     base = base or ""
     core_base = base
@@ -415,23 +426,72 @@ def filter_records_by_keyword(records: Sequence[JobRecord], keyword: str, city: 
             break
     core_base = core_base.strip()
 
-    out: List[JobRecord] = []
+    def norm(s: str) -> str:
+        s = str(s or "").strip()
+        s = s.replace("（", "(").replace("）", ")")
+        s = re.sub(r"\s+", "", s)
+        return s
+
+    core_base_n = norm(core_base)
+    level_n = norm(level or "")
+
+    strict_out: List[JobRecord] = []
+    loose_out: List[JobRecord] = []
+    dropped_empty_title = 0
+    dropped_city = 0
+    dropped_base = 0
+    dropped_level = 0
+    samples: List[str] = []
+
     for r in records:
-        title = (r.job_title or "").strip()
-        if not title:
+        title_raw = (r.job_title or "").strip()
+        if not title_raw:
+            dropped_empty_title += 1
             continue
+        title = norm(title_raw)
         if city_text:
             loc = (r.location_text or "").strip()
             if loc and city_text not in loc:
+                dropped_city += 1
+                if len(samples) < 5:
+                    samples.append(f"title={title_raw} loc={loc}")
                 continue
-        ok = True
-        if core_base and len(core_base) >= 2 and core_base not in title:
-            ok = False
-        if ok and level and level not in title:
-            ok = False
-        if ok:
-            out.append(r)
-    return out
+        ok_base = True
+        if core_base_n and len(core_base_n) >= 2 and core_base_n not in title:
+            ok_base = False
+        if not ok_base:
+            dropped_base += 1
+            if len(samples) < 5:
+                samples.append(f"title={title_raw} loc={(r.location_text or '').strip()}")
+            continue
+
+        loose_out.append(r)
+        if level_n and level_n in title:
+            strict_out.append(r)
+        elif not level_n:
+            strict_out.append(r)
+        else:
+            dropped_level += 1
+
+    kept = strict_out if strict_out else loose_out
+    used_mode = "strict" if strict_out else "loose"
+    stats = {
+        "extracted": len(records),
+        "kept": len(kept),
+        "kept_strict": len(strict_out),
+        "kept_loose": len(loose_out),
+        "used_mode": used_mode,
+        "city_raw": city_raw,
+        "city_filter_applied": bool(city_text),
+        "core_base": core_base_n,
+        "level": level_n,
+        "dropped_empty_title": dropped_empty_title,
+        "dropped_city": dropped_city,
+        "dropped_base": dropped_base,
+        "dropped_level": dropped_level,
+        "sample_dropped": samples,
+    }
+    return kept, stats
 
 
 def build_stealth_context_kwargs() -> Dict[str, Any]:
@@ -448,6 +508,7 @@ def build_stealth_context_kwargs() -> Dict[str, Any]:
         "timezone_id": "Asia/Shanghai",
         "viewport": {"width": w, "height": h},
         "user_agent": ua,
+        "bypass_csp": True,
     }
 
 
@@ -511,6 +572,23 @@ def detect_challenge(page) -> Optional[str]:
         content = page.content()
     except Exception:
         content = ""
+    try:
+        url = (page.url or "").strip()
+    except Exception:
+        url = ""
+
+    if url and any(x in url for x in ["/web/user", "passport-zp", "from=passport", "fromUrl="]):
+        return "需要登录"
+
+    if title and any(x in title for x in ["注册登录", "登录", "请先登录"]):
+        return "需要登录"
+
+    if url == "about:blank":
+        try:
+            if "<body></body>" in content or content.strip() == "<html><head></head><body></body></html>":
+                return "页面空白"
+        except Exception:
+            return "页面空白"
 
     for kw in ["安全验证", "滑动验证", "验证码", "人机识别", "访问受限", "验证中心"]:
         if kw in title or kw in content:
@@ -576,6 +654,266 @@ def zhilian_normalize_city(city_code_or_name: str) -> str:
     return _ZL_CITY_CODE_CACHE.get(s, s)
 
 
+def boss_build_joblist_api_url(keyword: str, city_code_or_name: str, page_no: int) -> str:
+    """构造BOSS直聘岗位列表接口URL（同源 fetch 用）。"""
+    params = {
+        "scene": "1",
+        "query": keyword,
+        "city": boss_normalize_city(city_code_or_name),
+        "page": str(page_no),
+        "pageSize": "30",
+    }
+    return "https://www.zhipin.com/wapi/zpgeek/search/joblist.json?" + urllib.parse.urlencode(params)
+
+
+def boss_cookie_header(cookies: Sequence[Dict[str, Any]]) -> str:
+    """将Playwright cookies结构转换为HTTP Cookie请求头字符串。"""
+    parts: List[str] = []
+    for c in cookies:
+        try:
+            name = str(c.get("name") or "").strip()
+            value = str(c.get("value") or "").strip()
+        except Exception:
+            continue
+        if name and value:
+            parts.append(f"{name}={value}")
+    return "; ".join(parts)
+
+
+def boss_fetch_joblist_by_cookies(api_url: str, cookies: Sequence[Dict[str, Any]], user_agent: str) -> Optional[Dict[str, Any]]:
+    """使用浏览器cookie在HTTP层请求BOSS岗位列表接口，避免影响已打开的浏览器页面。"""
+    import urllib.request
+
+    cookie_str = boss_cookie_header(cookies)
+    if not cookie_str:
+        return None
+    headers = {
+        "User-Agent": user_agent,
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "zh-CN,zh;q=0.9",
+        "Referer": "https://www.zhipin.com/web/geek/jobs",
+        "Origin": "https://www.zhipin.com",
+        "X-Requested-With": "XMLHttpRequest",
+        "Cookie": cookie_str,
+    }
+    req = urllib.request.Request(api_url, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            raw = resp.read()
+        return json.loads(raw.decode("utf-8", errors="ignore"))
+    except Exception:
+        return None
+
+
+def boss_payload_error(payload: Dict[str, Any]) -> Optional[str]:
+    """解析BOSS接口返回中的错误信息，正常时返回None。"""
+    try:
+        code = payload.get("code")
+        if code is None:
+            return None
+        code_str = str(code).strip()
+        if code_str in {"0", ""}:
+            return None
+        msg = payload.get("message") or payload.get("msg") or payload.get("error") or ""
+        msg = str(msg).strip()
+        return f"code={code_str} msg={msg}" if msg else f"code={code_str}"
+    except Exception:
+        return None
+
+
+def boss_payload_code(payload: Dict[str, Any]) -> Optional[str]:
+    """提取BOSS接口返回码，缺失时返回None。"""
+    try:
+        code = payload.get("code")
+        if code is None:
+            return None
+        return str(code).strip()
+    except Exception:
+        return None
+
+
+def boss_is_env_abnormal(payload: Dict[str, Any]) -> bool:
+    """判断BOSS接口是否返回“环境异常/风控”类错误码。"""
+    code = boss_payload_code(payload) or ""
+    return code in {"37", "36", "38"}
+
+
+def boss_get_user_agent_from_context(context) -> str:
+    """尽量从当前CDP上下文获取真实User-Agent，用于HTTP层请求。"""
+    try:
+        for p0 in reversed(getattr(context, "pages", [])):
+            try:
+                if p0 and (not p0.is_closed()) and (p0.url or "").strip().startswith("http"):
+                    ua = p0.evaluate("() => navigator.userAgent")
+                    if isinstance(ua, str) and ua.strip():
+                        return ua.strip()
+            except Exception:
+                continue
+    except Exception:
+        pass
+    try:
+        p1 = context.new_page()
+        p1.goto("https://www.zhipin.com/", wait_until="domcontentloaded", timeout=30000)
+        ua = p1.evaluate("() => navigator.userAgent")
+        try:
+            p1.close()
+        except Exception:
+            pass
+        if isinstance(ua, str) and ua.strip():
+            return ua.strip()
+    except Exception:
+        pass
+    return str(build_stealth_context_kwargs().get("user_agent") or "Mozilla/5.0").strip()
+
+
+def boss_close_tagged_pages(context, keep_page=None) -> int:
+    """关闭脚本为BOSS自动化流程创建的历史页面，避免页面堆积占用内存。"""
+    closed = 0
+    try:
+        pages = list(getattr(context, "pages", []))
+    except Exception:
+        pages = []
+    for p0 in pages:
+        if keep_page is not None and p0 is keep_page:
+            continue
+        try:
+            if getattr(p0, "_jd_scrapy_tag", "") != "boss_auto":
+                continue
+        except Exception:
+            continue
+        try:
+            if not p0.is_closed():
+                p0.close()
+                closed += 1
+        except Exception:
+            continue
+    return closed
+
+
+def boss_mark_page(page) -> None:
+    """为脚本创建的BOSS页面打标，便于后续清理。"""
+    try:
+        setattr(page, "_jd_scrapy_tag", "boss_auto")
+    except Exception:
+        pass
+
+
+def boss_recover_login_state(context, verbose: bool, page=None) -> None:
+    """当BOSS接口触发风控时，尝试在CDP浏览器内恢复登录态/完成验证。"""
+    created = False
+    if page is None:
+        boss_close_tagged_pages(context, keep_page=None)
+        created = True
+        try:
+            page = context.new_page()
+            boss_mark_page(page)
+        except Exception:
+            page = None
+    try:
+        if page is None:
+            return
+        try:
+            page.bring_to_front()
+        except Exception:
+            pass
+        page.goto("https://www.zhipin.com/web/geek/jobs", wait_until="domcontentloaded", timeout=60000)
+        for _ in range(120):
+            reason = detect_challenge(page)
+            if not reason:
+                return
+            if verbose:
+                print(f"[boss] challenge={reason}，请在已打开的Chrome中完成验证/刷新页面，脚本将自动继续...")
+            if reason == "需要登录":
+                try:
+                    page.locator("a:has-text('登录')").first.click(timeout=1500)
+                except Exception:
+                    try:
+                        page.locator("button:has-text('登录')").first.click(timeout=1500)
+                    except Exception:
+                        pass
+            time.sleep(2)
+            try:
+                page.reload(wait_until="domcontentloaded", timeout=60000)
+            except Exception:
+                pass
+    finally:
+        if created and page:
+            try:
+                page.close()
+            except Exception:
+                pass
+
+
+def boss_prepare_api_page(context, verbose: bool):
+    """为BOSS接口请求准备一个稳定页面，用于同源fetch以降低风控概率。"""
+    page = None
+    try:
+        for p0 in reversed(getattr(context, "pages", [])):
+            try:
+                u = (p0.url or "").strip()
+                if (not p0.is_closed()) and u and ("zhipin.com" in u) and (u != "about:blank") and (not u.startswith("chrome://")):
+                    page = p0
+                    break
+            except Exception:
+                continue
+    except Exception:
+        page = None
+    if page is None:
+        boss_close_tagged_pages(context, keep_page=None)
+        page = context.new_page()
+        boss_mark_page(page)
+    try:
+        page.bring_to_front()
+    except Exception:
+        pass
+    try:
+        page.goto("https://www.zhipin.com/web/geek/jobs", wait_until="domcontentloaded", timeout=60000)
+    except Exception:
+        pass
+    for _ in range(180):
+        reason = detect_challenge(page)
+        if not reason:
+            return page
+        if verbose:
+            print(f"[boss] challenge={reason}，请在已打开的Chrome中完成验证/刷新页面，脚本将自动继续...")
+        time.sleep(2)
+        try:
+            page.reload(wait_until="domcontentloaded", timeout=60000)
+        except Exception:
+            pass
+    return page
+
+
+def boss_fetch_joblist_by_page_fetch(page, api_url: str) -> Optional[Dict[str, Any]]:
+    """在浏览器页面内用fetch请求BOSS接口，尽量复用浏览器网络栈与登录态。"""
+    try:
+        result = page.evaluate(
+            """
+            async (u) => {
+              const resp = await fetch(u, {
+                method: 'GET',
+                credentials: 'include',
+                headers: {
+                  'accept': 'application/json, text/plain, */*',
+                  'x-requested-with': 'XMLHttpRequest'
+                }
+              });
+              const text = await resp.text();
+              return { status: resp.status, text };
+            }
+            """,
+            api_url,
+        )
+        if not isinstance(result, dict):
+            return None
+        text = result.get("text")
+        if not isinstance(text, str) or not text.strip():
+            return None
+        return json.loads(text)
+    except Exception:
+        return None
+
+
 def load_zhilian_city_code_map() -> Dict[str, str]:
     """从智联基础数据接口加载城市code映射表。"""
     import urllib.request
@@ -611,7 +949,17 @@ def load_zhilian_city_code_map() -> Dict[str, str]:
 
 class BossCrawler:
     def __init__(
-        self, headless: bool, proxy: Optional[str], slow_mo_ms: int, min_sleep: float, max_sleep: float, verbose: bool
+        self,
+        headless: bool,
+        proxy: Optional[str],
+        slow_mo_ms: int,
+        min_sleep: float,
+        max_sleep: float,
+        verbose: bool,
+        user_data_dir: Optional[str],
+        channel: Optional[str],
+        cdp_endpoint: Optional[str],
+        random_pause: bool,
     ):
         self.headless = headless
         self.proxy = proxy
@@ -619,12 +967,16 @@ class BossCrawler:
         self.min_sleep = min_sleep
         self.max_sleep = max_sleep
         self.verbose = verbose
+        self.user_data_dir = user_data_dir
+        self.channel = channel
+        self.cdp_endpoint = cdp_endpoint
+        self.random_pause = random_pause
 
     def build_url(self, keyword: str, city_code_or_name: str, page_no: int) -> str:
         """构造BOSS直聘搜索URL，city建议传城市code（如101010100）。"""
         q = urllib.parse.quote(keyword)
         city = urllib.parse.quote(boss_normalize_city(city_code_or_name))
-        return f"https://www.zhipin.com/web/geek/job?query={q}&city={city}&page={page_no}"
+        return f"https://www.zhipin.com/web/geek/jobs?query={q}&city={city}&page={page_no}"
 
     def extract_jobs(self, page, city: str, keyword: str, page_no: int) -> List[JobRecord]:
         """从BOSS结果页抽取岗位记录，尽量做选择器兜底。"""
@@ -692,6 +1044,76 @@ class BossCrawler:
             )
         return records
 
+    def extract_jobs_from_joblist_json(self, payload: Dict[str, Any], city: str, keyword: str, page_no: int) -> List[JobRecord]:
+        """从BOSS接口 joblist.json 的返回中抽取岗位记录。"""
+        root: Any = payload
+        if isinstance(root, dict):
+            root = root.get("zpData") or root.get("data") or root
+
+        job_list: Any = None
+        if isinstance(root, dict):
+            job_list = root.get("jobList") or root.get("job_list") or root.get("list")
+        if not isinstance(job_list, list):
+            job_list = []
+
+        records: List[JobRecord] = []
+        for item in job_list:
+            if not isinstance(item, dict):
+                continue
+            title = item.get("jobName") or item.get("jobTitle") or item.get("name")
+            salary = item.get("salaryDesc") or item.get("salary") or item.get("salaryText")
+            company = item.get("brandName") or item.get("companyName") or item.get("brand")
+            industry = item.get("brandIndustry") or item.get("brandIndustryName") or item.get("industry")
+            education = normalize_education(item.get("jobDegree") or item.get("degreeName") or item.get("degree"))
+            experience_text = item.get("jobExperience") or item.get("experienceName") or item.get("experience")
+            experience_year_min, experience_year_max = parse_experience_years(experience_text)
+
+            labels = item.get("jobLabels") or item.get("skills") or item.get("labels")
+            skills: List[str] = []
+            if isinstance(labels, list):
+                for x in labels:
+                    if isinstance(x, str) and x.strip():
+                        skills.append(x.strip())
+            skills_text = ";".join(dict.fromkeys(skills)) if skills else None
+
+            url = item.get("jobUrl") or item.get("detailUrl") or item.get("jobDetailUrl")
+            if not url:
+                enc_job_id = item.get("encryptJobId") or item.get("jobId")
+                if enc_job_id:
+                    url = f"https://www.zhipin.com/job_detail/{enc_job_id}.html"
+
+            salary_info = parse_salary_text(salary)
+            company_industry_mapped = map_industry(industry)
+            raw = {"query_keyword": keyword, "joblist_item": item}
+            records.append(
+                JobRecord(
+                    platform="boss",
+                    city=city,
+                    keyword=keyword,
+                    page_no=page_no,
+                    job_title=title,
+                    company_name=company,
+                    company_industry=industry,
+                    company_industry_mapped=company_industry_mapped,
+                    salary_text=salary,
+                    salary_min_month=salary_info.min_month,
+                    salary_max_month=salary_info.max_month,
+                    salary_avg_month=salary_info.avg_month,
+                    pay_months=salary_info.pay_months,
+                    salary_annualized_avg=salary_info.annualized_avg,
+                    location_text=item.get("jobArea") or item.get("locationName") or item.get("area"),
+                    education=education,
+                    experience_text=experience_text,
+                    experience_year_min=experience_year_min,
+                    experience_year_max=experience_year_max,
+                    skills_text=skills_text,
+                    job_url=url,
+                    crawled_at=dt.datetime.now(),
+                    raw=raw,
+                )
+            )
+        return records
+
     def crawl(self, cities: Sequence[str], keyword: str, pages_per_city: int) -> List[JobRecord]:
         """执行BOSS直聘采集。"""
         results: List[JobRecord] = []
@@ -699,43 +1121,270 @@ class BossCrawler:
             launch_kwargs: Dict[str, Any] = {"headless": self.headless, "slow_mo": self.slow_mo_ms}
             if self.proxy:
                 launch_kwargs["proxy"] = {"server": self.proxy}
+            if self.channel:
+                launch_kwargs["channel"] = self.channel
+            launch_kwargs["args"] = [
+                "--disable-blink-features=AutomationControlled",
+                "--disable-features=IsolateOrigins,site-per-process",
+            ]
+            launch_kwargs["ignore_default_args"] = ["--enable-automation"]
 
-            browser = p.chromium.launch(**launch_kwargs)
-            context = browser.new_context(**build_stealth_context_kwargs())
-            add_stealth_init_script(context)
-            page = context.new_page()
+            context = None
+            browser = None
+            should_close = True
+            if self.cdp_endpoint:
+                if self.verbose:
+                    print(f"[boss] connect_cdp={self.cdp_endpoint}")
+                browser = p.chromium.connect_over_cdp(self.cdp_endpoint)
+                should_close = False
+                context = browser.contexts[0] if browser.contexts else browser.new_context(**build_stealth_context_kwargs())
+            elif self.user_data_dir:
+                context = p.chromium.launch_persistent_context(
+                    self.user_data_dir, **launch_kwargs, **build_stealth_context_kwargs()
+                )
+                add_stealth_init_script(context)
+            else:
+                browser = p.chromium.launch(**launch_kwargs)
+                context = browser.new_context(**build_stealth_context_kwargs())
+                add_stealth_init_script(context)
+
+            if self.cdp_endpoint:
+                ua = boss_get_user_agent_from_context(context)
+                if self.min_sleep < 6.0:
+                    self.min_sleep = 6.0
+                if self.max_sleep < 12.0:
+                    self.max_sleep = 12.0
+                api_page = boss_prepare_api_page(context, verbose=self.verbose)
+                for city in cities:
+                    for page_no in range(1, pages_per_city + 1):
+                        api_url = boss_build_joblist_api_url(keyword, city, page_no)
+                        if self.verbose:
+                            print(f"[boss] joblist_http url={api_url}")
+                        payload: Optional[Dict[str, Any]] = None
+                        last_err: Optional[str] = None
+                        for attempt in range(1, 4):
+                            if api_page is None or api_page.is_closed():
+                                api_page = boss_prepare_api_page(context, verbose=self.verbose)
+                            payload = boss_fetch_joblist_by_page_fetch(api_page, api_url)
+                            if not payload:
+                                cookies = context.cookies("https://www.zhipin.com")
+                                payload = boss_fetch_joblist_by_cookies(api_url, cookies=cookies, user_agent=ua)
+                            if not payload:
+                                last_err = "CDP接口请求失败：cookie为空或HTTP请求失败"
+                            else:
+                                err = boss_payload_error(payload)
+                                if not err:
+                                    last_err = None
+                                    break
+                                last_err = f"BOSS接口返回异常：{err}"
+                                if boss_is_env_abnormal(payload):
+                                    boss_recover_login_state(context, verbose=self.verbose, page=api_page)
+                                time.sleep(random.uniform(3.0, 8.0))
+                                continue
+                            if attempt < 3:
+                                boss_recover_login_state(context, verbose=self.verbose, page=api_page)
+                                time.sleep(random.uniform(3.0, 8.0))
+                        if not payload:
+                            raise RuntimeError("CDP接口请求失败：请确保Chrome已登录BOSS且可正常浏览 zhipin.com 页面")
+                        if last_err:
+                            raise RuntimeError(f"{last_err}（请确认用于CDP的Chrome已登录）")
+                        page_records = self.extract_jobs_from_joblist_json(payload, city=city, keyword=keyword, page_no=page_no)
+                        kept, stats = filter_records_with_reason_stats(page_records, keyword=keyword, city=city)
+                        if self.verbose:
+                            print(f"[boss] joblist_api=Y extracted={len(page_records)} kept={len(kept)}")
+                            if len(page_records) > 0 and len(kept) == 0:
+                                print(f"[filter] platform=boss kw={keyword} stats={json.dumps(stats, ensure_ascii=False)}")
+                        results.extend(kept)
+                        time.sleep(random.uniform(self.min_sleep, self.max_sleep))
+                if browser and should_close:
+                    browser.close()
+                return results
+
+            if "page" not in locals() or page is None:
+                page = None
+            if page is None:
+                try:
+                    for p0 in reversed(getattr(context, "pages", [])):
+                        try:
+                            if not p0.is_closed() and p0.url and "zhipin.com" in p0.url:
+                                page = p0
+                                break
+                        except Exception:
+                            continue
+                except Exception:
+                    page = None
+            if page is None:
+                page = context.new_page()
+            if self.verbose:
+                try:
+                    page.on("pageerror", lambda exc: print(f"[boss] pageerror={exc}"))
+                    page.on(
+                        "console",
+                        lambda msg: print(f"[boss] console[{msg.type}] {msg.text}")
+                        if msg.type in {"warning", "error"}
+                        else None,
+                    )
+                except Exception:
+                    pass
+
+            def pick_active_page() -> None:
+                nonlocal page
+                try:
+                    if page.is_closed():
+                        page = context.pages[-1]
+                except Exception:
+                    pass
+                try:
+                    if page.url == "about:blank":
+                        for p2 in reversed(context.pages):
+                            try:
+                                if not p2.is_closed() and p2.url and "zhipin.com" in p2.url and p2.url != "about:blank":
+                                    page = p2
+                                    break
+                            except Exception:
+                                continue
+                except Exception:
+                    pass
 
             for city in cities:
                 for page_no in range(1, pages_per_city + 1):
                     url = self.build_url(keyword, city, page_no)
                     if self.verbose:
                         print(f"[boss] city={city} kw={keyword} page={page_no}/{pages_per_city} url={url}")
-                    page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                    api_payload: Optional[Dict[str, Any]] = None
+                    resp = None
+                    if not api_payload:
+                        try:
+                            with page.expect_response(
+                                lambda r: "/wapi/zpgeek/search/joblist.json" in (r.url or "") and r.status == 200,
+                                timeout=25000,
+                            ) as resp_info:
+                                try:
+                                    resp = page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                                except Exception as e:
+                                    if self.verbose:
+                                        print(f"[boss] goto_error={e}")
+                                    try:
+                                        page.evaluate("u => { window.location.href = u; }", url)
+                                    except Exception:
+                                        pass
+                            try:
+                                api_payload = resp_info.value.json()
+                            except Exception:
+                                api_payload = None
+                        except PlaywrightTimeoutError:
+                            try:
+                                resp = page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                            except Exception as e:
+                                if self.verbose:
+                                    print(f"[boss] goto_timeout_then_error={e}")
+                    if self.verbose:
+                        try:
+                            status = resp.status if resp else None
+                            print(f"[boss] resp_status={status}")
+                        except Exception:
+                            pass
+                    pick_active_page()
+                    if self.verbose:
+                        try:
+                            print(f"[boss] after_goto url={page.url} title={page.title()}")
+                        except Exception:
+                            pass
                     reason = detect_challenge(page)
                     if reason:
                         if self.headless:
-                            raise RuntimeError(f"BOSS触发安全校验：{reason}，建议使用 --headless false 运行后手动过验证")
+                            raise RuntimeError(
+                                f"BOSS触发校验：{reason}。建议设置 crawl.user_data_dir 并用 headless=false 先登录/过验证一次"
+                            )
+                        if self.verbose:
+                            print(f"[boss] challenge={reason}，等待你在浏览器中完成登录/验证...")
                         while True:
                             time.sleep(2)
+                            pick_active_page()
                             reason2 = detect_challenge(page)
                             if not reason2:
                                 break
+                    try:
+                        page.wait_for_selector("div.job-card-wrapper, li.job-card-wrapper", timeout=15000)
+                    except PlaywrightTimeoutError:
+                        pass
+                    pick_active_page()
+                    reason = detect_challenge(page)
+                    if reason and self.headless:
+                        raise RuntimeError(
+                            f"BOSS触发校验：{reason}。建议设置 crawl.user_data_dir 并用 headless=false 先登录/过验证一次"
+                        )
+                    if reason and not self.headless:
+                        if self.verbose:
+                            print(f"[boss] challenge={reason}，等待你在浏览器中完成登录/验证...")
+                        while True:
+                            time.sleep(2)
+                            pick_active_page()
+                            reason2 = detect_challenge(page)
+                            if not reason2:
+                                break
+                    if self.verbose:
+                        try:
+                            cookies = context.cookies("https://www.zhipin.com")
+                            print(f"[boss] final_url={page.url} cookies={len(cookies)} pages={len(context.pages)}")
+                            if page.url == "about:blank":
+                                for i, p2 in enumerate(context.pages):
+                                    try:
+                                        print(f"[boss] page[{i}] url={p2.url} title={p2.title() if not p2.is_closed() else '-'}")
+                                    except Exception:
+                                        continue
+                        except Exception:
+                            pass
                     page.wait_for_timeout(random.randint(800, 1600))
-                    page_records = self.extract_jobs(page, city=city, keyword=keyword, page_no=page_no)
-                    kept = filter_records_by_keyword(page_records, keyword=keyword, city=city)
+                    pick_active_page()
+                    if api_payload:
+                        page_records = self.extract_jobs_from_joblist_json(api_payload, city=city, keyword=keyword, page_no=page_no)
+                        if self.verbose:
+                            print(f"[boss] joblist_api=Y")
+                    else:
+                        page_records = self.extract_jobs(page, city=city, keyword=keyword, page_no=page_no)
+                        if self.verbose:
+                            print(f"[boss] joblist_api=N")
+                    kept, stats = filter_records_with_reason_stats(page_records, keyword=keyword, city=city)
                     if self.verbose:
                         print(f"[boss] extracted={len(page_records)} kept={len(kept)}")
+                        if len(page_records) > 0 and len(kept) == 0:
+                            print(f"[filter] platform=boss kw={keyword} stats={json.dumps(stats, ensure_ascii=False)}")
+                        if len(page_records) == 0:
+                            try:
+                                html = page.content()
+                                print(f"[boss] html_head={html[:400].replace(chr(10),' ')}")
+                            except Exception:
+                                pass
                     results.extend(kept)
                     time.sleep(random.uniform(self.min_sleep, self.max_sleep))
 
-            context.close()
-            browser.close()
+            if not self.headless and self.random_pause:
+                pause_s = random.randint(1, 60)
+                if self.verbose:
+                    print(f"[boss] pause_seconds={pause_s}")
+                time.sleep(pause_s)
+
+            try:
+                if should_close:
+                    context.close()
+            except Exception:
+                pass
+            if browser and should_close:
+                browser.close()
         return results
 
 
 class ZhilianCrawler:
     def __init__(
-        self, headless: bool, proxy: Optional[str], slow_mo_ms: int, min_sleep: float, max_sleep: float, verbose: bool
+        self,
+        headless: bool,
+        proxy: Optional[str],
+        slow_mo_ms: int,
+        min_sleep: float,
+        max_sleep: float,
+        verbose: bool,
+        user_data_dir: Optional[str],
     ):
         self.headless = headless
         self.proxy = proxy
@@ -743,6 +1392,7 @@ class ZhilianCrawler:
         self.min_sleep = min_sleep
         self.max_sleep = max_sleep
         self.verbose = verbose
+        self.user_data_dir = user_data_dir
 
     def build_url(self, keyword: str, city_name: str, page_no: int) -> str:
         """构造智联招聘搜索URL，city建议使用城市code以确保筛选生效。"""
@@ -884,9 +1534,15 @@ class ZhilianCrawler:
             if self.proxy:
                 launch_kwargs["proxy"] = {"server": self.proxy}
 
-            browser = p.chromium.launch(**launch_kwargs)
-            context = browser.new_context(**build_stealth_context_kwargs())
-            add_stealth_init_script(context)
+            context = None
+            browser = None
+            if self.user_data_dir:
+                context = p.chromium.launch_persistent_context(self.user_data_dir, **launch_kwargs, **build_stealth_context_kwargs())
+                add_stealth_init_script(context)
+            else:
+                browser = p.chromium.launch(**launch_kwargs)
+                context = browser.new_context(**build_stealth_context_kwargs())
+                add_stealth_init_script(context)
             page = context.new_page()
 
             for city in cities:
@@ -904,14 +1560,17 @@ class ZhilianCrawler:
                         pass
                     page.wait_for_timeout(random.randint(800, 1600))
                     page_records = self.extract_jobs(page, city=city, keyword=keyword, page_no=page_no)
-                    kept = filter_records_by_keyword(page_records, keyword=keyword, city=city)
+                    kept, stats = filter_records_with_reason_stats(page_records, keyword=keyword, city=city)
                     if self.verbose:
                         print(f"[zhilian] extracted={len(page_records)} kept={len(kept)}")
+                        if len(page_records) > 0 and len(kept) == 0:
+                            print(f"[filter] platform=zhilian kw={keyword} stats={json.dumps(stats, ensure_ascii=False)}")
                     results.extend(kept)
                     time.sleep(random.uniform(self.min_sleep, self.max_sleep))
 
             context.close()
-            browser.close()
+            if browser:
+                browser.close()
         return results
 
 
@@ -920,7 +1579,7 @@ def ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
 
 
-def write_excel(records: Sequence[JobRecord], out_path: str) -> str:
+def write_excel(records: Sequence[JobRecord], out_path: str, missing: Optional[Sequence[Dict[str, Any]]] = None) -> str:
     """将明细与汇总写入Excel。"""
     wb = Workbook()
     ws_raw = wb.active
@@ -1033,6 +1692,24 @@ def write_excel(records: Sequence[JobRecord], out_path: str) -> str:
 
     for idx, h in enumerate(sum_headers, start=1):
         ws_sum.column_dimensions[get_column_letter(idx)].width = max(len(h) + 2, 16)
+
+    ws_missing = wb.create_sheet("missing")
+    missing_headers = ["平台", "城市", "岗位关键词", "原因"]
+    ws_missing.append(missing_headers)
+    for c in range(1, len(missing_headers) + 1):
+        ws_missing.cell(row=1, column=c).font = Font(bold=True)
+    if missing:
+        for item in missing:
+            ws_missing.append(
+                [
+                    item.get("platform"),
+                    item.get("city"),
+                    item.get("keyword"),
+                    item.get("reason"),
+                ]
+            )
+    for idx, h in enumerate(missing_headers, start=1):
+        ws_missing.column_dimensions[get_column_letter(idx)].width = max(len(h) + 2, 24)
 
     ensure_dir(os.path.dirname(out_path) or ".")
     try:
@@ -1245,8 +1922,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--keyword", required=False, default=None, help="岗位关键词，例如：Python工程师")
     p.add_argument("--cities", required=False, default=None, help="城市列表，逗号分隔，例如：北京,上海,深圳 或 BOSS城市code")
     p.add_argument("--pages", type=int, default=3, help="每个城市抓取页数")
-    p.add_argument("--platform", choices=["boss", "zhilian", "both"], default="both", help="抓取平台")
-    p.add_argument("--headless", type=str, default="true", help="true/false，遇验证码建议false")
+    p.add_argument("--platform", choices=["boss", "zhilian", "both"], default=None, help="抓取平台（不填则使用配置）")
+    p.add_argument("--headless", type=str, default=None, help="true/false，遇验证码建议false（不填则使用配置）")
     p.add_argument("--proxy", default=None, help="代理，例如：http://user:pass@host:port")
     p.add_argument("--slowmo", type=int, default=0, help="Playwright slow_mo 毫秒")
     p.add_argument("--sleep-min", type=float, default=2.0, help="翻页间隔最小秒数")
@@ -1255,6 +1932,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--mysql-table", default="job_salary_raw", help="MySQL表名")
     p.add_argument("--save-mysql", type=str, default="false", help="true/false，从环境变量读取MySQL连接并落库")
     p.add_argument("--verbose", type=str, default="false", help="true/false，打印抓取进度日志")
+    p.add_argument("--user-data-dir", default=None, help="浏览器用户数据目录，用于保留登录态（BOSS建议配置）")
+    p.add_argument("--boss-headless", default=None, help="BOSS单独指定true/false（不填则使用全局headless）")
+    p.add_argument("--boss-channel", default=None, help="BOSS浏览器通道，例如 chrome（不填则使用默认）")
+    p.add_argument("--boss-cdp", default=None, help="连接已打开的Chrome调试端口，例如 http://127.0.0.1:9222")
     return p.parse_args(argv)
 
 
@@ -1307,12 +1988,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if mk > 0:
             keywords = keywords[:mk]
 
-    platform = str(crawl_cfg.get("platform", args.platform)).strip() or str(args.platform)
+    platform = str(args.platform).strip() if args.platform else str(crawl_cfg.get("platform", "both")).strip() or "both"
     if platform not in {"boss", "zhilian", "both"}:
         raise SystemExit("platform 仅支持 boss/zhilian/both")
 
-    headless = str_to_bool(str(crawl_cfg.get("headless", args.headless)))
+    if args.headless is None:
+        headless = str_to_bool(str(crawl_cfg.get("headless", "true")))
+    else:
+        headless = str_to_bool(str(args.headless))
     verbose = str_to_bool(str(crawl_cfg.get("verbose", args.verbose)))
+    user_data_dir = str(args.user_data_dir).strip() if args.user_data_dir else str(crawl_cfg.get("user_data_dir", "")).strip() or None
+    if args.boss_headless is not None:
+        boss_headless = str_to_bool(str(args.boss_headless))
+    elif "boss_headless" in crawl_cfg:
+        boss_headless = str_to_bool(str(crawl_cfg.get("boss_headless")))
+    else:
+        boss_headless = headless
+    boss_channel = str(args.boss_channel).strip() if args.boss_channel else str(crawl_cfg.get("boss_channel", "")).strip() or None
+    boss_cdp = str(args.boss_cdp).strip() if args.boss_cdp else str(crawl_cfg.get("boss_cdp", "")).strip() or None
     proxy = crawl_cfg.get("proxy", args.proxy)
     proxy = str(proxy).strip() if proxy else None
     slowmo = int(crawl_cfg.get("slowmo_ms", args.slowmo))
@@ -1324,39 +2017,64 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         out_path = os.path.join("output", f"salary_{ts}.xlsx")
 
     all_records: List[JobRecord] = []
+    missing: List[Dict[str, Any]] = []
     if verbose:
         print(
             f"[run] platform={platform} cities={len(cities)} pages_per_city={pages} keywords={len(keywords)} "
-            f"headless={headless} proxy={'Y' if proxy else 'N'} out={out_path}"
+            f"headless={headless} boss_headless={boss_headless} proxy={'Y' if proxy else 'N'} "
+            f"user_data_dir={user_data_dir or '-'} out={out_path}"
         )
     for kw in keywords:
         if platform in {"boss", "both"}:
-            all_records.extend(
-                BossCrawler(
-                    headless=headless,
+            try:
+                boss_records = BossCrawler(
+                    headless=boss_headless,
                     proxy=proxy,
                     slow_mo_ms=slowmo,
                     min_sleep=sleep_min,
                     max_sleep=sleep_max,
                     verbose=verbose,
+                    user_data_dir=user_data_dir,
+                    channel=boss_channel,
+                    cdp_endpoint=boss_cdp,
+                    random_pause=(args.keyword is not None and (not boss_headless) and (not boss_cdp)),
                 ).crawl(cities=cities, keyword=kw, pages_per_city=pages)
-            )
+                all_records.extend(boss_records)
+                city_hit = {r.city for r in boss_records}
+                for city in cities:
+                    if city not in city_hit:
+                        missing.append({"platform": "boss", "city": city, "keyword": kw, "reason": "无结果"})
+            except Exception as e:
+                if verbose:
+                    print(f"[boss] error kw={kw} err={e}")
+                for city in cities:
+                    missing.append({"platform": "boss", "city": city, "keyword": kw, "reason": f"异常: {e}"})
 
         if platform in {"zhilian", "both"}:
-            all_records.extend(
-                ZhilianCrawler(
+            try:
+                zl_records = ZhilianCrawler(
                     headless=headless,
                     proxy=proxy,
                     slow_mo_ms=slowmo,
                     min_sleep=sleep_min,
                     max_sleep=sleep_max,
                     verbose=verbose,
+                    user_data_dir=user_data_dir,
                 ).crawl(cities=cities, keyword=kw, pages_per_city=pages)
-            )
+                all_records.extend(zl_records)
+                city_hit = {r.city for r in zl_records}
+                for city in cities:
+                    if city not in city_hit:
+                        missing.append({"platform": "zhilian", "city": city, "keyword": kw, "reason": "无结果"})
+            except Exception as e:
+                if verbose:
+                    print(f"[zhilian] error kw={kw} err={e}")
+                for city in cities:
+                    missing.append({"platform": "zhilian", "city": city, "keyword": kw, "reason": f"异常: {e}"})
 
-    out_path = write_excel(all_records, out_path=out_path)
+    out_path = write_excel(all_records, out_path=out_path, missing=missing)
     if verbose:
-        print(f"[run] excel_saved={out_path} records={len(all_records)}")
+        print(f"[run] excel_saved={out_path} records={len(all_records)} missing={len(missing)}")
 
     save_mysql = str_to_bool(str(mysql_cfg.get("enabled", args.save_mysql)))
     if save_mysql:

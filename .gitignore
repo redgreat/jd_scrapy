@@ -164,6 +164,9 @@ output/
 # Playwright browsers
 .playwright/
 
+# Browser profiles
+.user_data/
+
 # Local config
 conf/config.yml
 

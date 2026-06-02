@@ -19,6 +19,12 @@ crawl:
   platform: "both"
   # 是否无头模式；遇到验证码建议 false 手动过一次
   headless: true
+  # 浏览器用户数据目录，用于保留登录态（BOSS建议配置）
+  user_data_dir: ".user_data"
+  # BOSS单独指定是否无头；建议 false（BOSS对无头更敏感）
+  boss_headless: false
+  # BOSS浏览器通道；建议 chrome（使用本机Chrome，命中率更高）
+  boss_channel: "chrome"
   # 代理；格式示例：http://user:pass@host:port；不使用填 null
   proxy: null
   # Playwright slow_mo（毫秒）
@@ -33,6 +39,8 @@ crawl:
   max_keywords: 5
   # 输出Excel路径；如果文件被占用会自动加时间戳另存
   output_excel: "output/salary.xlsx"
+  # 是否打印抓取进度日志
+  verbose: false
 
 data:
   # 城市列表（中文名即可）
