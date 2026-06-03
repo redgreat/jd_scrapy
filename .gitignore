@@ -169,6 +169,7 @@ output/
 
 # Local config
 conf/config.yml
+conf/llm_keyword_plan_cache.json
 
 # Spyder project settings
 .spyderproject
@@ -229,3 +230,4 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+

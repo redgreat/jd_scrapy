@@ -1,5 +1,6 @@
 cd d:\github\jd_scrapy
 $env:PLAYWRIGHT_BROWSERS_PATH="d:\github\jd_scrapy\.playwright"
+$env:DEEPSEEK_API_KEY="sk-e086454425564e61b99fa4448679bf67"
 
 & "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222 --user-data-dir="d:\github\jd_scrapy\.user_data"
 

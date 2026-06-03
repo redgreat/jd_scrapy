@@ -34,13 +34,33 @@ crawl:
   # 翻页/城市切换最大等待秒数
   sleep_max: 5.0
   # 每个城市抓取页数
-  pages_per_city: 1
+  pages_per_city: 5
   # 限制岗位关键词数量（用于调试）；0 或不填表示不限制
-  max_keywords: 5
+  max_keywords: 0
+  # 匹配阈值（0~1）；越低越宽松
+  match_threshold: 0.4
+  # 是否宽松匹配；启用大模型时建议 true
+  match_relax: true
   # 输出Excel路径；如果文件被占用会自动加时间戳另存
   output_excel: "output/salary.xlsx"
   # 是否打印抓取进度日志
   verbose: false
+
+llm:
+  # 是否启用大模型辅助生成“更通用的搜索词”和“更宽松的匹配词”
+  enabled: false
+  # DeepSeek OpenAI兼容接口地址
+  endpoint: "https://api.deepseek.com/v1/chat/completions"
+  # 模型名称
+  model: "deepseek-v4"
+  # 从哪个环境变量读取API Key（避免把密钥写进配置文件），例如 DEEPSEEK_API_KEY
+  api_key_env: "DEEPSEEK_API_KEY"
+  # 也支持直接写在这里（不推荐；如果写了会覆盖 api_key_env）
+  api_key: ""
+  # 超时秒数
+  timeout_s: 25
+  # 温度
+  temperature: 0.2
 
 data:
   # 城市列表（中文名即可）
